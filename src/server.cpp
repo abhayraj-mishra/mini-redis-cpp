@@ -1,27 +1,47 @@
 #include "server.hpp"
 #include <iostream>
 #include <sstream>
-#include <thread>
-#include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-Server::Server(int port, KVStore& store) : port_(port), store_(store) {}
+namespace { constexpr size_t kReadChunk = 4096; }
+
+Server::Server(int port, KVStore& store, size_t numThreads)
+    : port_(port), store_(store) {
+    if (numThreads == 0) {
+        // Blocking I/O → pool size must cover peak concurrent clients.
+        // Start at 64; scale up with cores.
+        numThreads = std::max<size_t>(64, std::thread::hardware_concurrency() * 4);
+    }
+    running_.store(true);
+    for (size_t i = 0; i < numThreads; ++i)
+        workers_.emplace_back(&Server::workerLoop, this);
+}
+
+Server::~Server() { stop(); }
+
+void Server::stop() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false)) return;
+    queueCv_.notify_all();
+    for (auto& t : workers_) if (t.joinable()) t.join();
+    if (serverSocket_ >= 0) { close(serverSocket_); serverSocket_ = -1; }
+}
 
 std::string Server::processCommand(const std::string& line) {
     std::istringstream iss(line);
     std::string cmd, key, value;
     iss >> cmd;
-
-    for (auto& c : cmd) c = toupper(c);
+    for (auto& c : cmd) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
     if (cmd == "SET") {
         iss >> key;
         std::getline(iss, value);
         if (!value.empty() && value[0] == ' ') value.erase(0, 1);
         store_.set(key, value);
-        store_.appendToLog("SET " + key + " " + value);
         return "OK\n";
     } else if (cmd == "GET") {
         iss >> key;
@@ -29,9 +49,7 @@ std::string Server::processCommand(const std::string& line) {
         return v ? (*v + "\n") : "(nil)\n";
     } else if (cmd == "DEL") {
         iss >> key;
-        bool removed = store_.del(key);
-        store_.appendToLog("DEL " + key);
-        return removed ? "1\n" : "0\n";
+        return store_.del(key) ? "1\n" : "0\n";
     } else if (cmd == "EXISTS") {
         iss >> key;
         return store_.exists(key) ? "1\n" : "0\n";
@@ -43,69 +61,95 @@ std::string Server::processCommand(const std::string& line) {
     } else if (cmd == "PING") {
         return "PONG\n";
     }
-
     return "ERR unknown command\n";
 }
 
+bool Server::sendAll(int fd, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        ssize_t n = write(fd, data.data() + sent, data.size() - sent);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
 void Server::handleClient(int clientSocket) {
-    char buffer[4096];
-    while (true) {
-        ssize_t bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
-        if (bytesRead <= 0) break; // client disconnected
+    std::string buffer;
+    buffer.reserve(kReadChunk);
+    char chunk[kReadChunk];
 
-        buffer[bytesRead] = '\0';
-        std::string line(buffer);
+    while (running_.load()) {
+        ssize_t n = read(clientSocket, chunk, sizeof(chunk));
+        if (n <= 0) break;
+        buffer.append(chunk, static_cast<size_t>(n));
 
-        // strip trailing newline/carriage return
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
+        size_t pos;
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
 
-        if (line.empty()) continue;
-
-        std::string response = processCommand(line);
-        write(clientSocket, response.c_str(), response.size());
+            std::string response = processCommand(line);
+            if (!sendAll(clientSocket, response)) {
+                close(clientSocket);
+                return;
+            }
+        }
     }
     close(clientSocket);
 }
 
-void Server::run() {
-    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket < 0) {
-        std::cerr << "Failed to create socket\n";
-        return;
+void Server::workerLoop() {
+    while (running_.load()) {
+        int fd = -1;
+        {
+            std::unique_lock<std::mutex> lock(queueMtx_);
+            queueCv_.wait(lock, [this] {
+                return !clientQueue_.empty() || !running_.load();
+            });
+            if (!running_.load() && clientQueue_.empty()) return;
+            fd = clientQueue_.front();
+            clientQueue_.pop();
+        }
+        handleClient(fd);
     }
+}
+
+void Server::run() {
+    serverSocket_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket_ < 0) { std::cerr << "socket() failed\n"; return; }
 
     int opt = 1;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(serverSocket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(port_);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port_);
 
-    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        std::cerr << "Bind failed on port " << port_ << "\n";
-        return;
+    if (bind(serverSocket_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "bind failed on port " << port_ << "\n"; return;
     }
-
-    if (listen(serverSocket, 128) < 0) {
-        std::cerr << "Listen failed\n";
-        return;
+    if (listen(serverSocket_, 512) < 0) {
+        std::cerr << "listen failed\n"; return;
     }
+    std::cout << "mini-redis listening on port " << port_
+              << " with " << workers_.size() << " workers" << std::endl;
 
-    std::cout << "mini-redis listening on port " << port_ << "...\n";
-
-    while (true) {
+    while (running_.load()) {
         sockaddr_in clientAddr{};
-        socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(serverSocket, (sockaddr*)&clientAddr, &clientLen);
-        if (clientSocket < 0) continue;
-
-        // One thread per client for now -- fine for a resume project demo,
-        // replace with a thread pool (see TODO in server.hpp) if you want
-        // to show off handling higher concurrency.
-        std::thread(&Server::handleClient, this, clientSocket).detach();
+        socklen_t len = sizeof(clientAddr);
+        int fd = accept(serverSocket_, (sockaddr*)&clientAddr, &len);
+        if (fd < 0) {
+            if (!running_.load()) break;
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queueMtx_);
+            clientQueue_.push(fd);
+        }
+        queueCv_.notify_one();
     }
-
-    close(serverSocket);
 }
