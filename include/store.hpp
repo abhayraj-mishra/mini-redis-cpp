@@ -4,32 +4,46 @@
 #include <mutex>
 #include <chrono>
 #include <optional>
-#include <vector>
+#include <array>
+#include <fstream>
+#include <thread>
+#include <atomic>
 
-// A thread-safe in-memory key-value store with optional TTL expiry.
-// TODO(day2): shard this into N buckets, each with its own mutex,
-//             to reduce lock contention under many concurrent clients.
 class KVStore {
 public:
+    static constexpr size_t kShards = 16;
+
+    KVStore();
+    ~KVStore();
+
     void set(const std::string& key, const std::string& value);
     std::optional<std::string> get(const std::string& key);
     bool del(const std::string& key);
     bool exists(const std::string& key);
-
-    // TODO(day2): implement TTL properly.
-    // Store an expiry timestamp alongside the value and have a background
-    // thread sweep expired keys periodically (see reaper thread in server.hpp).
     void expire(const std::string& key, int seconds);
 
-    // TODO(day3): implement AOF persistence.
-    // Every successful set/del should be appended as a line to a log file,
-    // e.g. "SET key value\n" / "DEL key\n". On startup, replay the log
-    // line-by-line into this store before starting the server loop.
     void appendToLog(const std::string& line);
     void loadFromLog(const std::string& path);
 
+    void startReaper(std::chrono::milliseconds interval = std::chrono::milliseconds(1000));
+    void stopReaper();
+
 private:
-    std::unordered_map<std::string, std::string> data_;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiries_;
-    std::mutex mutex_;
+    struct Shard {
+        std::unordered_map<std::string, std::string> data;
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiries;
+        mutable std::mutex mtx;
+    };
+
+    std::array<Shard, kShards> shards_;
+    Shard& shardFor(const std::string& key);
+
+    std::mutex logMtx_;
+    std::ofstream logFile_;
+    std::string logPath_ = "dump.aof";
+    size_t logWritesSinceFlush_ = 0;
+
+    std::thread reaper_;
+    std::atomic<bool> stopReaper_{false};
+    void reapExpired();
 };

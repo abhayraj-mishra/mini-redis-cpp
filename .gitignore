@@ -1,0 +1,7 @@
+build/
+*.o
+mini_redis
+dump.aof
+bench.py.save
+__pycache__/
+*.pyc
